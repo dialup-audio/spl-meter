@@ -8,7 +8,7 @@ Free tools by [dialup.audio](https://dialup.audio).
 
 ## What it does
 
-- Shows the current C-weighted, slow SPL from REW's SPL meter (`85 dBC`), updated 4 times a second.
+- Shows the current SPL from REW's SPL meter (`85 dBC`), updated 4 times a second. Weighting (A, C or Z) and averaging (Fast or Slow) are set from the menu and take effect immediately. Defaults are C and Slow.
 - Launches REW with the API enabled if it isn't already running that way.
 - Opens and starts REW's SPL meter for you, then minimizes REW so it's out of the way.
 - **Input device:** the menu shows which mic REW is using, and **Input device** lets you pick another from REW's own list.
@@ -23,7 +23,7 @@ Free tools by [dialup.audio](https://dialup.audio).
 ## How it works
 
 1. On launch, checks whether REW is running with `-api`. If it isn't running, or is running without it, the app starts a REW instance with `-api` (`open -na REW.app --args -api`). A second REW window is harmless.
-2. Talks to REW's local API at `127.0.0.1:4735`: opens the SPL meter, configures it (C-weighting, slow filter, no high-pass), and starts it.
+2. Talks to REW's local API at `127.0.0.1:4735`: opens the SPL meter, configures it (your weighting and averaging choices, no high-pass), and starts it.
 3. Polls the meter and shows the level.
 4. Minimizes REW's windows.
 
@@ -34,7 +34,7 @@ Nothing leaves your machine unless you click Check for Updates (see below).
 The chosen mic is stored in the app's standard macOS preferences:
 
 ```bash
-defaults read audio.dialup.rew-spl-meter inputDevice
+defaults read audio.dialup.rew-spl-meter inputDevice   # also: weighting, averaging
 defaults delete audio.dialup.rew-spl-meter          # reset
 ```
 

@@ -12,6 +12,10 @@ static double kOffsetDb = 0; // rack reads hotter than LP
 // The mic REW should measure with. Stored in NSUserDefaults:
 //   defaults read audio.dialup.rew-spl-meter inputDevice
 static NSString * const kInputDeviceKey = @"inputDevice";
+// Meter settings, in NSUserDefaults too (defaults: C-weighted, Slow). REW accepts A/C/Z and Fast/Slow.
+static NSString * const kWeightingKey = @"weighting";
+static NSString * const kFilterKey    = @"averaging";
+
 static NSString * const kRewBase = @"http://127.0.0.1:4735";
 
 // REW's /levels can contain `"spl": NaN` (not valid JSON), so read the number from the text.
@@ -95,6 +99,10 @@ static NSArray<NSString *> *CoreAudioInputDeviceNames(void) {
 @property BOOL micPresent;                // is that mic currently connected?
 @property (strong) NSMenuItem *inputItem;
 @property (strong) NSMenu *inputMenu;
+@property (copy) NSString *weighting;     // "A", "C" or "Z"
+@property (copy) NSString *filter;        // "Fast" or "Slow"
+@property (strong) NSMenuItem *weightingItem;
+@property (strong) NSMenuItem *filterItem;
 @property (copy) NSArray<NSString *> *rewInputDevices;
 @property pid_t rewApiPid;
 @end
@@ -131,6 +139,27 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     inputParent.submenu = self.inputMenu;
     [menu addItem:inputParent];
 
+    // Weighting and averaging apply to the meter immediately.
+    NSDictionary<NSString *, NSArray *> *options = @{
+        @"weighting": @[@[@"A", @"A-weighted"], @[@"C", @"C-weighted"], @[@"Z", @"Z (unweighted)"]],
+        @"filter":    @[@[@"Fast", @"Fast (125 ms)"], @[@"Slow", @"Slow (1 s)"]],
+    };
+    for (NSString *kind in @[@"weighting", @"filter"]) {
+        NSMenu *sub = [[NSMenu alloc] init];
+        for (NSArray *opt in options[kind]) {
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:opt[1]
+                                                          action:@selector(selectMeterOption:)
+                                                   keyEquivalent:@""];
+            item.target = self;
+            item.representedObject = @{ @"kind": kind, @"value": opt[0] };
+            [sub addItem:item];
+        }
+        NSMenuItem *parent = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+        parent.submenu = sub;
+        [menu addItem:parent];
+        if ([kind isEqualToString:@"weighting"]) self.weightingItem = parent; else self.filterItem = parent;
+    }
+
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *about = [[NSMenuItem alloc]
@@ -159,7 +188,13 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{
         (__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES });
 
-    self.wantedInput = [[NSUserDefaults standardUserDefaults] stringForKey:kInputDeviceKey];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    self.wantedInput = [defaults stringForKey:kInputDeviceKey];
+    self.weighting = [@[@"A", @"C", @"Z"] containsObject:[defaults stringForKey:kWeightingKey]]
+        ? [defaults stringForKey:kWeightingKey] : @"C";
+    self.filter = [@[@"Fast", @"Slow"] containsObject:[defaults stringForKey:kFilterKey]]
+        ? [defaults stringForKey:kFilterKey] : @"Slow";
+    [self updateMeterOptionMenus];
     [self updateInputMenuTitles];
 
     // Fires when any audio device is plugged in or removed.
@@ -195,6 +230,36 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         if ([Trim(name) isEqualToString:wanted]) return YES;
     }
     return NO;
+}
+
+- (void)updateMeterOptionMenus {
+    self.weightingItem.title = [NSString stringWithFormat:@"Weighting: %@", self.weighting];
+    self.filterItem.title = [NSString stringWithFormat:@"Averaging: %@", self.filter];
+
+    for (NSMenuItem *parent in @[self.weightingItem, self.filterItem]) {
+        for (NSMenuItem *item in parent.submenu.itemArray) {
+            NSDictionary *info = item.representedObject;
+            NSString *current = [info[@"kind"] isEqualToString:@"weighting"] ? self.weighting : self.filter;
+            item.state = [info[@"value"] isEqualToString:current] ? NSControlStateValueOn : NSControlStateValueOff;
+        }
+    }
+}
+
+- (void)selectMeterOption:(NSMenuItem *)sender {
+    NSDictionary *info = sender.representedObject;
+    NSString *key = [info[@"kind"] isEqualToString:@"weighting"] ? kWeightingKey : kFilterKey;
+    if ([info[@"kind"] isEqualToString:@"weighting"]) self.weighting = info[@"value"];
+    else self.filter = info[@"value"];
+
+    [[NSUserDefaults standardUserDefaults] setObject:info[@"value"] forKey:key];
+    [self updateMeterOptionMenus];
+
+    // REW applies configuration changes while the meter is running; no restart needed.
+    if (self.micPresent) {
+        [self sendRewConfigurationWithCompletion:^(BOOL ok) {
+            if (!ok) NSLog(@"failed applying meter settings");
+        }];
+    }
 }
 
 - (void)showNoMic {
@@ -489,6 +554,17 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
             done = YES;
             for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
                 AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+
+                // Minimizing an already-minimized window makes macOS flash it up and back
+                // down, so leave those alone.
+                CFTypeRef minimized = NULL;
+                if (AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute, &minimized) == kAXErrorSuccess
+                    && minimized) {
+                    BOOL already = CFBooleanGetValue((CFBooleanRef)minimized);
+                    CFRelease(minimized);
+                    if (already) continue;
+                }
+
                 AXError setErr = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute,
                                                               kCFBooleanTrue);
                 if (setErr != kAXErrorSuccess) {
@@ -652,11 +728,11 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         @"showLeq": @YES,
         @"showSEL": @NO,
 
-        @"splWeighting": @"C",
-        @"leqWeighting": @"C",
-        @"selWeighting": @"C",
+        @"splWeighting": self.weighting,
+        @"leqWeighting": self.weighting,
+        @"selWeighting": self.weighting,
 
-        @"filter": @"Slow",
+        @"filter": self.filter,
 
         @"highPassActive": @NO,
         @"rollingLeqActive": @NO,
@@ -777,8 +853,8 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         // wrong/stuck input, bad sample rate, meter stopped. Say so instead of going blank.
         double spl = 0;
         NSString *title = ParseSplLevel(data, &spl)
-            ? [NSString stringWithFormat:@"%.0f dBC", spl + kOffsetDb]
-            : @"-- dBC";
+            ? [NSString stringWithFormat:@"%.0f dB%@", spl + kOffsetDb, self.weighting]
+            : [NSString stringWithFormat:@"-- dB%@", self.weighting];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [self setMeterTitle:title];
