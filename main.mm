@@ -4,19 +4,21 @@
 static NSString * const kRepo    = @"dialup-audio/rew-spl-meter";
 static NSString * const kSiteURL = @"https://dialup.audio";
 
-static NSString * const kRewUrl =
-    @"http://127.0.0.1:4735/spl-meter/1/levels";
-
-static double kOffsetDb = 0; // rack reads hotter than LP
 
 // The mic REW should measure with. Stored in NSUserDefaults:
 //   defaults read audio.dialup.rew-spl-meter inputDevice
 static NSString * const kInputDeviceKey = @"inputDevice";
 // Meter settings, in NSUserDefaults too (defaults: C-weighted, Slow). REW accepts A/C/Z and Fast/Slow.
+// Added to every reading before it's displayed (REW's API has no live meter offset).
+static NSString * const kOffsetKey = @"splOffset";
 static NSString * const kWeightingKey = @"weighting";
 static NSString * const kFilterKey    = @"averaging";
 
-static NSString * const kRewBase = @"http://127.0.0.1:4735";
+// REW's API port (Settings > API in REW; the app has to match) and whether REW is launched
+// headless. Both in NSUserDefaults: apiPort, headless.
+static NSString * const kPortKey     = @"apiPort";
+static NSString * const kHeadlessKey = @"headless";
+static const NSInteger kDefaultApiPort = 4735;
 
 // REW's /levels can contain `"spl": NaN` (not valid JSON), so read the number from the text.
 // Returns YES with the level if the meter is actually reading; NO for NaN, REW's -180 floor
@@ -103,15 +105,16 @@ static NSArray<NSString *> *CoreAudioInputDeviceNames(void) {
 @property (copy) NSString *filter;        // "Fast" or "Slow"
 @property (strong) NSMenuItem *weightingItem;
 @property (strong) NSMenuItem *filterItem;
+@property double splOffset;               // dB, applied to the displayed level
+@property (strong) NSMenuItem *offsetItem;
 @property (copy) NSArray<NSString *> *rewInputDevices;
-@property pid_t rewApiPid;
+@property NSInteger apiPort;
+@property BOOL headless;                  // launch REW with -nogui
+@property BOOL noApi;                     // REW is running but its API isn't reachable
+@property (strong) NSTimer *apiWatchTimer;
+@property (strong) NSMenuItem *headlessItem;
+@property (strong) NSMenuItem *portItem;
 @end
-
-typedef NS_ENUM(NSInteger, RewState) {
-    RewStateNotRunning,
-    RewStateRunningWithApi,
-    RewStateRunningWithoutApi,
-};
 
 static const NSInteger kMaxMeterStartAttempts = 30;
 static const NSTimeInterval kMeterStartRetryDelay = 2.0;
@@ -129,7 +132,6 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 
     menu.delegate = self;
 
-    // Greyed-out line showing the current mic, then a submenu to change it.
     self.inputItem = [[NSMenuItem alloc] initWithTitle:@"Input: …" action:nil keyEquivalent:@""];
     [menu addItem:self.inputItem];
 
@@ -138,6 +140,8 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
                                                          action:nil keyEquivalent:@""];
     inputParent.submenu = self.inputMenu;
     [menu addItem:inputParent];
+
+    [menu addItem:[NSMenuItem separatorItem]];
 
     // Weighting and averaging apply to the meter immediately.
     NSDictionary<NSString *, NSArray *> *options = @{
@@ -159,6 +163,40 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         [menu addItem:parent];
         if ([kind isEqualToString:@"weighting"]) self.weightingItem = parent; else self.filterItem = parent;
     }
+
+    self.offsetItem = [[NSMenuItem alloc] initWithTitle:@"SPL offset…"
+                                                 action:@selector(editSplOffset:)
+                                          keyEquivalent:@""];
+    self.offsetItem.target = self;
+    [menu addItem:self.offsetItem];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // REW connection settings.
+    NSMenu *rewMenu = [[NSMenu alloc] init];
+    self.headlessItem = [[NSMenuItem alloc] initWithTitle:@"Run REW headless"
+                                                   action:@selector(toggleHeadless:)
+                                            keyEquivalent:@""];
+    self.headlessItem.target = self;
+    self.headlessItem.toolTip = @"Applies the next time this app starts REW.";
+    [rewMenu addItem:self.headlessItem];
+
+    self.portItem = [[NSMenuItem alloc] initWithTitle:@"API port…"
+                                               action:@selector(editApiPort:)
+                                        keyEquivalent:@""];
+    self.portItem.target = self;
+    [rewMenu addItem:self.portItem];
+    [rewMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *reconnect = [[NSMenuItem alloc] initWithTitle:@"Reconnect to REW"
+                                                       action:@selector(reconnect:)
+                                                keyEquivalent:@""];
+    reconnect.target = self;
+    [rewMenu addItem:reconnect];
+
+    NSMenuItem *rewParent = [[NSMenuItem alloc] initWithTitle:@"REW" action:nil keyEquivalent:@""];
+    rewParent.submenu = rewMenu;
+    [menu addItem:rewParent];
 
     [menu addItem:[NSMenuItem separatorItem]];
 
@@ -184,17 +222,17 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     [menu addItem:quit];
     self.statusItem.menu = menu;
 
-    // Prompts for Accessibility access (needed to minimize REW's windows) if not yet granted.
-    AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{
-        (__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES });
-
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     self.wantedInput = [defaults stringForKey:kInputDeviceKey];
     self.weighting = [@[@"A", @"C", @"Z"] containsObject:[defaults stringForKey:kWeightingKey]]
         ? [defaults stringForKey:kWeightingKey] : @"C";
     self.filter = [@[@"Fast", @"Slow"] containsObject:[defaults stringForKey:kFilterKey]]
         ? [defaults stringForKey:kFilterKey] : @"Slow";
+    self.apiPort = [defaults integerForKey:kPortKey] > 0 ? [defaults integerForKey:kPortKey] : kDefaultApiPort;
+    self.headless = [defaults objectForKey:kHeadlessKey] ? [defaults boolForKey:kHeadlessKey] : YES;
+    self.splOffset = [defaults doubleForKey:kOffsetKey];
     [self updateMeterOptionMenus];
+    [self updateRewMenu];
     [self updateInputMenuTitles];
 
     // Fires when any audio device is plugged in or removed.
@@ -206,17 +244,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         [self evaluateMicPresence];
     });
 
-    [self ensureRewRunningWithApi];
-
-    if (self.wantedInput && ![self wantedInputIsPresent]) {
-        [self showNoMic];
-    } else {
-        // No saved mic yet: the start sequence adopts whatever REW is currently using.
-        self.micPresent = YES;
-        [self startRewMeter];
-        [self startSPLPolling];
-    }
-    [self refreshRewInputDevices];
+    [self connectToRew];
 }
 
 #pragma mark - Input device
@@ -235,6 +263,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 - (void)updateMeterOptionMenus {
     self.weightingItem.title = [NSString stringWithFormat:@"Weighting: %@", self.weighting];
     self.filterItem.title = [NSString stringWithFormat:@"Averaging: %@", self.filter];
+    self.offsetItem.title = [NSString stringWithFormat:@"SPL offset: %+g dB", self.splOffset];
 
     for (NSMenuItem *parent in @[self.weightingItem, self.filterItem]) {
         for (NSMenuItem *item in parent.submenu.itemArray) {
@@ -243,6 +272,37 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
             item.state = [info[@"value"] isEqualToString:current] ? NSControlStateValueOn : NSControlStateValueOff;
         }
     }
+}
+
+- (void)editSplOffset:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"SPL offset";
+    alert.informativeText = @"Added to every reading in the menubar. Use a negative number to read lower, e.g. -3.2. This is useful for monitoring situations where you're forced to mount the microphone outside of the listening position. Even a few feet off can be surprisingly accurate, especially with dBC slow.";
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 120, 24)];
+    field.stringValue = [NSString stringWithFormat:@"%g", self.splOffset];
+    alert.accessoryView = field;
+    [alert addButtonWithTitle:@"Save"];
+    [alert addButtonWithTitle:@"Cancel"];
+    [NSApp activateIgnoringOtherApps:YES];
+    [alert.window setInitialFirstResponder:field];
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    NSString *text = [field.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    double value = 0;
+    NSScanner *scanner = [NSScanner scannerWithString:text];
+    BOOL valid = text.length == 0 || ([scanner scanDouble:&value] && scanner.isAtEnd && fabs(value) <= 100);
+    if (!valid) {
+        NSAlert *bad = [[NSAlert alloc] init];
+        bad.messageText = @"That isn't a valid offset";
+        bad.informativeText = @"Enter a number of dB between -100 and 100.";
+        [bad runModal];
+        return;
+    }
+
+    self.splOffset = value;
+    if (value == 0) [[NSUserDefaults standardUserDefaults] removeObjectForKey:kOffsetKey];
+    else [[NSUserDefaults standardUserDefaults] setDouble:value forKey:kOffsetKey];
+    [self updateMeterOptionMenus];
 }
 
 - (void)selectMeterOption:(NSMenuItem *)sender {
@@ -272,6 +332,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 // Called on every device add/remove. Unplug: stop and show NO MIC.
 // Plug back in: run the full start sequence again (set device, open, configure, start).
 - (void)evaluateMicPresence {
+    if (self.noApi) return;   // nothing to restart until REW's API is reachable
     BOOL present = [self wantedInputIsPresent];
 
     if (present && !self.micPresent) {
@@ -286,9 +347,13 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (void)updateInputMenuTitles {
-    self.inputItem.title = self.wantedInput
-        ? [NSString stringWithFormat:@"Input: %@", Trim(self.wantedInput)]
-        : @"Input: (none)";
+    if (self.noApi) {
+        self.inputItem.title = @"REW is running without its API";
+    } else {
+        self.inputItem.title = self.wantedInput
+            ? [NSString stringWithFormat:@"Input: %@", Trim(self.wantedInput)]
+            : @"Input: (none)";
+    }
 
     [self.inputMenu removeAllItems];
     if (self.rewInputDevices.count == 0) {
@@ -313,7 +378,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 
 // Asks REW which inputs it can use, then rebuilds the submenu.
 - (void)refreshRewInputDevices {
-    NSURL *url = [NSURL URLWithString:[kRewBase stringByAppendingString:@"/audio/java/input-devices"]];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/audio/java/input-devices"]];
     [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:
       ^(NSData *data, NSURLResponse *response, NSError *error) {
         id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
@@ -342,7 +407,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 
 // Tells REW to use the wanted input. If we don't have one saved yet, adopt REW's current one.
 - (void)applyInputDeviceWithCompletion:(void (^)(BOOL ok))completion {
-    NSURL *url = [NSURL URLWithString:[kRewBase stringByAppendingString:@"/audio/java/input-device"]];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/audio/java/input-device"]];
 
     if (!self.wantedInput) {
         [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:
@@ -470,9 +535,19 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     [task resume];
 }
 
-// Looks for the REW process in `ps -A` and checks for the -api flag, e.g.
-// 36507 ??  0:07.89 /Applications/REW/REW.app/Contents/MacOS/JavaApplicationStub -api
-- (RewState)currentRewState {
+#pragma mark - Connecting to REW
+
+- (NSString *)rewBase {
+    return [NSString stringWithFormat:@"http://127.0.0.1:%ld", (long)self.apiPort];
+}
+
+- (void)updateRewMenu {
+    self.headlessItem.state = self.headless ? NSControlStateValueOn : NSControlStateValueOff;
+    self.portItem.title = [NSString stringWithFormat:@"API port: %ld…", (long)self.apiPort];
+}
+
+// Process ids of every running REW (it might not have its API on).
+- (NSArray<NSNumber *> *)rewProcessIDs {
     NSTask *task = [[NSTask alloc] init];
     task.executableURL = [NSURL fileURLWithPath:@"/bin/ps"];
     task.arguments = @[@"-A", @"-o", @"pid=,command="];
@@ -484,107 +559,198 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     NSError *error = nil;
     if (![task launchAndReturnError:&error]) {
         NSLog(@"failed to run ps: %@", error);
-        return RewStateNotRunning;
+        return @[];
     }
 
     NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
     [task waitUntilExit];
 
     NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-
-    RewState state = RewStateNotRunning;
-    self.rewApiPid = 0;
-
+    NSMutableArray<NSNumber *> *pids = [NSMutableArray array];
     for (NSString *line in [output componentsSeparatedByString:@"\n"]) {
         if ([line rangeOfString:@"REW.app/Contents/MacOS/"].location == NSNotFound) continue;
-
-        NSArray<NSString *> *args = [[line stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceCharacterSet]]
-            componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-
-        if ([args containsObject:@"-api"]) {
-            self.rewApiPid = (pid_t)[args.firstObject intValue];
-            return RewStateRunningWithApi;
-        }
-        state = RewStateRunningWithoutApi;
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        pid_t pid = (pid_t)[trimmed intValue];
+        if (pid > 0) [pids addObject:@(pid)];
     }
-
-    return state;
+    return pids;
 }
 
-- (void)ensureRewRunningWithApi {
-    switch ([self currentRewState]) {
-        case RewStateRunningWithApi:
-            NSLog(@"REW already running with -api");
-            break;
-
-        case RewStateNotRunning:
-        case RewStateRunningWithoutApi: {
-            // -n opens a new instance even if a non-api REW is already running. Who cares.
-            // If this isn't the beta build, REW errors on the unknown arg. Ignored for now.
-            NSLog(@"launching REW with -api");
-            NSError *error = nil;
-            NSTask *task = [[NSTask alloc] init];
-            task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
-            task.arguments = @[@"-na", @"REW.app", @"--args", @"-api", @"-nogui"];
-            if (![task launchAndReturnError:&error]) {
-                NSLog(@"failed to launch REW: %@", error);
-            }
-            break;
-        }
-    }
+- (BOOL)rewIsRunning {
+    return [self rewProcessIDs].count > 0;
 }
 
-// Real minimize (not Cmd+H hide) goes through the Accessibility API, so the app
-// needs to be granted Accessibility access in System Settings > Privacy & Security.
-- (void)minimizeRewWindowsAttempt:(NSInteger)attempt {
-    if (attempt >= 10) {
-        NSLog(@"gave up minimizing REW windows");
+// Asks REW to quit (so it can prompt about unsaved measurements), waits for it to exit
+// (REW is slow to close), then starts it again with the API on.
+- (void)restartRewWithApi {
+    for (NSNumber *pid in [self rewProcessIDs]) {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid.intValue];
+        if (app) [app terminate];
+        else kill(pid.intValue, SIGTERM);
+    }
+    self.statusItem.button.title = @"REW…";
+    [self relaunchRewWhenGone:90];
+}
+
+- (void)relaunchRewWhenGone:(NSInteger)secondsLeft {
+    if (![self rewIsRunning]) {
+        [self launchRew];   // the watch timer notices when the API comes up
         return;
     }
 
-    BOOL done = NO;
-
-    if ([self currentRewState] == RewStateRunningWithApi) {
-        AXUIElementRef appElement = AXUIElementCreateApplication(self.rewApiPid);
-        CFArrayRef windows = NULL;
-        AXError err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute,
-                                                    (CFTypeRef *)&windows);
-        if (err == kAXErrorSuccess && windows && CFArrayGetCount(windows) > 0) {
-            done = YES;
-            for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
-                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-
-                // Minimizing an already-minimized window makes macOS flash it up and back
-                // down, so leave those alone.
-                CFTypeRef minimized = NULL;
-                if (AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute, &minimized) == kAXErrorSuccess
-                    && minimized) {
-                    BOOL already = CFBooleanGetValue((CFBooleanRef)minimized);
-                    CFRelease(minimized);
-                    if (already) continue;
-                }
-
-                AXError setErr = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute,
-                                                              kCFBooleanTrue);
-                if (setErr != kAXErrorSuccess) {
-                    NSLog(@"failed to minimize REW window: AXError %d", (int)setErr);
-                }
-            }
-        } else if (err != kAXErrorSuccess) {
-            NSLog(@"couldn't read REW windows: AXError %d", (int)err);
-        }
-        if (windows) CFRelease(windows);
-        CFRelease(appElement);
+    if (secondsLeft <= 0) {
+        NSLog(@"REW didn't quit");
+        self.statusItem.button.title = @"NO API";
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"REW didn't quit";
+        alert.informativeText = @"Quit REW yourself, then choose REW → Reconnect to REW.";
+        [NSApp activateIgnoringOtherApps:YES];
+        [alert runModal];
+        return;
     }
 
-    if (done) return;
-
-    // Window may not exist yet; try again shortly.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [self minimizeRewWindowsAttempt:attempt + 1];
+        [self relaunchRewWhenGone:secondsLeft - 1];
     });
+}
+
+- (void)launchRew {
+    // -nogui runs REW headless so there's no window to get in the way. -n always opens a new
+    // instance. If REW is older than the beta that added these flags, it errors on them.
+    NSMutableArray<NSString *> *args = [@[@"-na", @"REW.app", @"--args", @"-api"] mutableCopy];
+    if (self.headless) [args addObject:@"-nogui"];
+    NSLog(@"launching REW: open %@", [args componentsJoinedByString:@" "]);
+
+    NSError *error = nil;
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
+    task.arguments = args;
+    if (![task launchAndReturnError:&error]) {
+        NSLog(@"failed to launch REW: %@", error);
+    }
+}
+
+// Does something answer on REW's API port?
+- (void)probeApi:(void (^)(BOOL up))completion {
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/audio/java/input-device"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.timeoutInterval = 2;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:
+      ^(NSData *data, NSURLResponse *response, NSError *error) {
+        BOOL up = !error && [(NSHTTPURLResponse *)response statusCode] == 200;
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(up); });
+    }] resume];
+}
+
+// Works out what state REW is in and gets metering going:
+//   API answers          -> use it
+//   REW isn't running    -> launch it with the API on, then wait for it to come up
+//   REW without its API  -> say so, and keep watching in case that changes
+- (void)connectToRew {
+    [self.apiWatchTimer invalidate];
+    self.apiWatchTimer = nil;
+
+    [self probeApi:^(BOOL up) {
+        if (up) { [self beginMetering]; return; }
+
+        if (![self rewIsRunning]) {
+            [self launchRew];
+            [self beginMetering];   // the start sequence retries until the API is up
+            return;
+        }
+
+        [self showNoApi];
+    }];
+}
+
+- (void)beginMetering {
+    self.noApi = NO;
+    [self updateInputMenuTitles];
+
+    if (self.wantedInput && ![self wantedInputIsPresent]) {
+        [self showNoMic];
+    } else {
+        // No saved mic yet: the start sequence adopts whatever REW is currently using.
+        self.micPresent = YES;
+        [self startRewMeter];
+        [self startSPLPolling];
+    }
+    [self refreshRewInputDevices];
+}
+
+- (void)showNoApi {
+    self.noApi = YES;
+    self.micPresent = NO;
+    self.sequenceGeneration++;
+    [self stopSPLPolling];
+    self.statusItem.button.title = @"NO API";
+    [self updateInputMenuTitles];
+
+    // If the user turns the API on (or restarts REW with it), pick up from there.
+    self.apiWatchTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES
+                                                           block:^(NSTimer *timer) {
+        [self probeApi:^(BOOL up) {
+            if (up && self.noApi) {
+                [self.apiWatchTimer invalidate];
+                self.apiWatchTimer = nil;
+                [self beginMetering];
+            }
+        }];
+    }];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"REW is running without its API";
+    alert.informativeText = [NSString stringWithFormat:
+        @"This app can quit REW and start it again with the API on. REW will ask to save anything "
+        @"unsaved first.\n\n"
+        @"To avoid this next time, turn on Settings → API → “Start the API when REW starts” in REW.\n\n"
+        @"Looking for the API on port %ld. If yours is different, set it under REW → API port.",
+        (long)self.apiPort];
+    [alert addButtonWithTitle:@"Quit REW and Restart With API"];
+    [alert addButtonWithTitle:@"Not Now"];
+    [NSApp activateIgnoringOtherApps:YES];
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        [self restartRewWithApi];
+    }
+}
+
+- (void)reconnect:(id)sender {
+    [self connectToRew];
+}
+
+- (void)toggleHeadless:(id)sender {
+    self.headless = !self.headless;
+    [[NSUserDefaults standardUserDefaults] setBool:self.headless forKey:kHeadlessKey];
+    [self updateRewMenu];
+}
+
+- (void)editApiPort:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"REW API port";
+    alert.informativeText = @"The default is 4735.";
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 120, 24)];
+    field.stringValue = [NSString stringWithFormat:@"%ld", (long)self.apiPort];
+    alert.accessoryView = field;
+    [alert addButtonWithTitle:@"Save"];
+    [alert addButtonWithTitle:@"Cancel"];
+    [NSApp activateIgnoringOtherApps:YES];
+    [alert.window setInitialFirstResponder:field];
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    NSInteger port = field.integerValue;
+    if (port < 1 || port > 65535) {
+        NSAlert *bad = [[NSAlert alloc] init];
+        bad.messageText = @"That isn't a valid port";
+        bad.informativeText = @"Enter a number from 1 to 65535.";
+        [bad runModal];
+        return;
+    }
+
+    self.apiPort = port;
+    [[NSUserDefaults standardUserDefaults] setInteger:port forKey:kPortKey];
+    [self updateRewMenu];
+    [self connectToRew];
 }
 
 // Full start sequence: set the input device, configure the SPL meter, start it.
@@ -612,7 +778,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 // before the swap finishes gets the Start undone, so wait until REW reports the new device.
 - (void)waitForRewInputDevice:(NSString *)device attempts:(NSInteger)attempts
                    generation:(NSUInteger)generation completion:(void (^)(void))completion {
-    NSURL *url = [NSURL URLWithString:[kRewBase stringByAppendingString:@"/audio/java/input-device"]];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/audio/java/input-device"]];
     [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:
       ^(NSData *data, NSURLResponse *response, NSError *error) {
         id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
@@ -639,7 +805,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 // REW has no meter status endpoint; /levels reads -180 or NaN while the meter isn't running.
 // After Start, check it's really producing levels and press Start again if it isn't.
 - (void)verifyMeterRunning:(NSUInteger)generation attempt:(NSInteger)attempt {
-    NSURL *url = [NSURL URLWithString:kRewUrl];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/spl-meter/1/levels"]];
     [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:
       ^(NSData *data, NSURLResponse *response, NSError *error) {
         BOOL live = ParseSplLevel(data, NULL);
@@ -699,7 +865,6 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
                         if (!ok) { [self retryStartSequence:generation reason:@"start"]; return; }
 
                         self.meterStartAttempts = 0;
-                        [self minimizeRewWindowsAttempt:0];
                         [self verifyMeterRunning:generation attempt:0];
                     });
                 }];
@@ -710,7 +875,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (void)sendRewConfigurationWithCompletion:(void (^)(BOOL ok))completion {
-    NSURL *url = [NSURL URLWithString:@"http://127.0.0.1:4735/spl-meter/1/configuration"];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/spl-meter/1/configuration"]];
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = @"POST";
@@ -775,7 +940,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (void)sendRewCommand:(NSString *)command completion:(void (^)(BOOL ok))completion {
-    NSURL *url = [NSURL URLWithString:@"http://127.0.0.1:4735/spl-meter/1/command"];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/spl-meter/1/command"]];
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = @"POST";
@@ -828,7 +993,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (void)updateSpl {
-    NSURL *url = [NSURL URLWithString:kRewUrl];
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/spl-meter/1/levels"]];
 
     NSURLSessionDataTask *task =
     [[NSURLSession sharedSession] dataTaskWithURL:url
@@ -846,7 +1011,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         // wrong/stuck input, bad sample rate, meter stopped. Say so instead of going blank.
         double spl = 0;
         NSString *title = ParseSplLevel(data, &spl)
-            ? [NSString stringWithFormat:@"%.0f dB%@", spl + kOffsetDb, self.weighting]
+            ? [NSString stringWithFormat:@"%.0f dB%@", spl + self.splOffset, self.weighting]
             : [NSString stringWithFormat:@"-- dB%@", self.weighting];
 
         dispatch_async(dispatch_get_main_queue(), ^{
