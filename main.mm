@@ -1,12 +1,12 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreAudio/CoreAudio.h>
 
-static NSString * const kRepo    = @"dialup-audio/spl-bar";
+static NSString * const kRepo    = @"dialup-audio/spl-meter";
 static NSString * const kSiteURL = @"https://dialup.audio";
 // Links go through dialup.audio (which redirects to GitHub for now) so they can be
 // repointed later without shipping a new version.
-static NSString * const kHelpURL     = @"https://dialup.audio/spl-bar";
-static NSString * const kIssuesURL   = @"https://dialup.audio/spl-bar/issues";
+static NSString * const kHelpURL     = @"https://dialup.audio/spl-meter";
+static NSString * const kIssuesURL   = @"https://dialup.audio/spl-meter/issues";
 static NSString * const kCheckOnStartupKey = @"checkUpdatesOnStartup";
 
 // Unset until the user answers the first-launch question.
@@ -19,7 +19,7 @@ static BOOL CheckOnStartup() {
 
 
 // The mic REW should measure with. Stored in NSUserDefaults:
-//   defaults read audio.dialup.spl-bar inputDevice
+//   defaults read audio.dialup.spl-meter inputDevice
 static NSString * const kInputDeviceKey = @"inputDevice";
 // Meter settings, in NSUserDefaults too (defaults: C-weighted, Slow). REW accepts A/C/Z and Fast/Slow.
 // Added to every reading before it's displayed (REW's API has no live meter offset).
@@ -138,7 +138,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    NSLog(@"SPL Bar launched");
+    NSLog(@"SPL Meter launched");
     self.statusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:48];
 
@@ -492,7 +492,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (NSString *)appName {
-    return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"SPL Bar";
+    return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"SPL Meter";
 }
 
 - (NSString *)appVersion {
@@ -606,7 +606,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.timeoutInterval = 15;
     [req setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"dialup-audio-spl-bar" forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"dialup-audio-spl-meter" forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {

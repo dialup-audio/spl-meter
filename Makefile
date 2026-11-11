@@ -7,7 +7,7 @@ build:
 	cmake --build $(BUILD_DIR) -j
 
 run: build
-	open ./$(BUILD_DIR)/spl-bar.app
+	open ./$(BUILD_DIR)/spl-meter.app
 
 clean:
 	rm -rf $(BUILD_DIR)
