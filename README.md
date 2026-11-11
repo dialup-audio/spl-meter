@@ -10,9 +10,9 @@ Free tools by [dialup.audio](https://dialup.audio).
 
 - Shows the current SPL from REW's SPL meter (`85 dBC`), updated 4 times a second. Weighting (A, C or Z) and averaging (Fast or Slow) are set from the menu and take effect immediately. Defaults are C and Slow.
 - Launches REW with the API enabled if it isn't already running that way.
-- Opens and starts REW's SPL meter for you, then minimizes REW so it's out of the way.
+- Configures and starts REW's SPL meter for you, then minimizes REW so it's out of the way.
 - **Input device:** the menu shows which mic REW is using, and **Input device** lets you pick another from REW's own list.
-- **Unplug and replug:** if the mic is disconnected, the menubar shows `NO MIC` (REW itself keeps showing stale readings). When it's plugged back in, the app sets the input device and reopens and restarts the meter automatically.
+- **Unplug and replug:** if the mic is disconnected, the menubar shows `NO MIC` (REW itself keeps showing stale readings). When it's plugged back in, the app sets the input device and restarts the meter automatically.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Free tools by [dialup.audio](https://dialup.audio).
 ## How it works
 
 1. On launch, checks whether REW is running with `-api`. If it isn't running, or is running without it, the app starts a REW instance with `-api` (`open -na REW.app --args -api`). A second REW window is harmless.
-2. Talks to REW's local API at `127.0.0.1:4735`: opens the SPL meter, configures it (your weighting and averaging choices, no high-pass), and starts it.
+2. Talks to REW's local API at `127.0.0.1:4735`: sets your input device, configures the SPL meter (your weighting and averaging choices, no high-pass), and starts it.
 3. Polls the meter and shows the level.
 4. Minimizes REW's windows.
 

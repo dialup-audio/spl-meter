@@ -526,7 +526,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
             NSError *error = nil;
             NSTask *task = [[NSTask alloc] init];
             task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
-            task.arguments = @[@"-na", @"REW.app", @"--args", @"-api"];
+            task.arguments = @[@"-na", @"REW.app", @"--args", @"-api", @"-nogui"];
             if (![task launchAndReturnError:&error]) {
                 NSLog(@"failed to launch REW: %@", error);
             }
@@ -587,7 +587,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     });
 }
 
-// Full start sequence: set the input device, open the SPL meter, configure it, start it.
+// Full start sequence: set the input device, configure the SPL meter, start it.
 // Each step retries from the top on failure (REW may still be starting up).
 - (void)startRewMeter {
     self.meterStartAttempts = 0;
@@ -688,26 +688,19 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         if (![self wantedInputIsPresent]) { [self showNoMic]; return; }
 
         [self waitForRewInputDevice:self.wantedInput attempts:15 generation:generation completion:^{
-        [self sendRewCommand:@"Open" completion:^(BOOL ok) {
+        [self sendRewConfigurationWithCompletion:^(BOOL ok) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (generation != self.sequenceGeneration) return;
-                if (!ok) { [self retryStartSequence:generation reason:@"open"]; return; }
+                if (!ok) { [self retryStartSequence:generation reason:@"configuration"]; return; }
 
-                [self sendRewConfigurationWithCompletion:^(BOOL ok) {
+                [self sendRewCommand:@"Start" completion:^(BOOL ok) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         if (generation != self.sequenceGeneration) return;
-                        if (!ok) { [self retryStartSequence:generation reason:@"configuration"]; return; }
+                        if (!ok) { [self retryStartSequence:generation reason:@"start"]; return; }
 
-                        [self sendRewCommand:@"Start" completion:^(BOOL ok) {
-                            dispatch_async(dispatch_get_main_queue(), ^{
-                                if (generation != self.sequenceGeneration) return;
-                                if (!ok) { [self retryStartSequence:generation reason:@"start"]; return; }
-
-                                self.meterStartAttempts = 0;
-                                [self minimizeRewWindowsAttempt:0];
-                                [self verifyMeterRunning:generation attempt:0];
-                            });
-                        }];
+                        self.meterStartAttempts = 0;
+                        [self minimizeRewWindowsAttempt:0];
+                        [self verifyMeterRunning:generation attempt:0];
                     });
                 }];
             });
