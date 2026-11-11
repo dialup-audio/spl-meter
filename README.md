@@ -1,4 +1,4 @@
-# REW SPL Meter
+# SPL Bar
 
 A live SPL reading from [Room EQ Wizard](https://www.roomeqwizard.com/) in your macOS menubar.
 
@@ -29,7 +29,9 @@ Free tools by [dialup.audio](https://dialup.audio).
 2. Talks to REW's local API: sets your input device, configures the SPL meter (your weighting and averaging choices, no high-pass), and starts it.
 3. Polls the meter and shows the level.
 
-Nothing leaves your machine unless you click Check for Updates (see below).
+If the app started REW headless, quitting the app also shuts that REW down. A REW that was already running is left alone.
+
+Nothing leaves your machine except the update check, which you can turn off (see below).
 
 ## Settings
 
@@ -41,8 +43,8 @@ The **REW** submenu has the connection settings:
 Settings are stored in the app's standard macOS preferences:
 
 ```bash
-defaults read audio.dialup.rew-spl-meter   # inputDevice, weighting, averaging, splOffset, apiPort, headless
-defaults delete audio.dialup.rew-spl-meter # reset
+defaults read audio.dialup.spl-bar   # inputDevice, weighting, averaging, splOffset, apiPort, headless
+defaults delete audio.dialup.spl-bar # reset
 ```
 
 On first launch, the app adopts whichever input REW is already using.
@@ -53,7 +55,7 @@ None. The app talks to REW over localhost and to Core Audio for device changes, 
 
 ## Install
 
-Download the latest zip from [Releases](https://github.com/dialup-audio/rew-spl-meter/releases), unzip, and drag the app to Applications. To start it at login, add it under System Settings → General → Login Items.
+Download the latest zip from [Releases](https://github.com/dialup-audio/spl-bar/releases), unzip, and drag the app to Applications. To start it at login, add it under System Settings → General → Login Items.
 
 ## Build from source
 
@@ -66,4 +68,4 @@ make run
 
 ## Updates
 
-The app never touches the internet on its own. **Check for Updates…** asks GitHub whether a newer release exists and, if so, offers to open the release page. Nothing is downloaded or installed automatically. That click is the only request the app ever makes outside your machine (REW is talked to over localhost).
+Once a launch, the app asks GitHub whether a newer release exists and only speaks up if there is one; turn this off with **Check for Updates on Startup** in the app's menu, and the app makes no network requests at all. **Check for Updates Now** does the same on demand and always tells you the result. Nothing is downloaded or installed automatically: the Download button opens the product page on dialup.audio. REW is talked to over localhost, so these checks are the only requests the app makes outside your machine. The same menu has **Help** and **Report an Issue**, which open the project pages on dialup.audio.

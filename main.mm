@@ -1,12 +1,23 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreAudio/CoreAudio.h>
 
-static NSString * const kRepo    = @"dialup-audio/rew-spl-meter";
+static NSString * const kRepo    = @"dialup-audio/spl-bar";
 static NSString * const kSiteURL = @"https://dialup.audio";
+// Links go through dialup.audio (which redirects to GitHub for now) so they can be
+// repointed later without shipping a new version.
+static NSString * const kHelpURL     = @"https://dialup.audio/spl-bar";
+static NSString * const kIssuesURL   = @"https://dialup.audio/spl-bar/issues";
+static NSString * const kCheckOnStartupKey = @"checkUpdatesOnStartup";
+
+// On unless the user has turned it off.
+static BOOL CheckOnStartup() {
+    id value = [[NSUserDefaults standardUserDefaults] objectForKey:kCheckOnStartupKey];
+    return value ? [value boolValue] : YES;
+}
 
 
 // The mic REW should measure with. Stored in NSUserDefaults:
-//   defaults read audio.dialup.rew-spl-meter inputDevice
+//   defaults read audio.dialup.spl-bar inputDevice
 static NSString * const kInputDeviceKey = @"inputDevice";
 // Meter settings, in NSUserDefaults too (defaults: C-weighted, Slow). REW accepts A/C/Z and Fast/Slow.
 // Added to every reading before it's displayed (REW's API has no live meter offset).
@@ -107,11 +118,13 @@ static NSArray<NSString *> *CoreAudioInputDeviceNames(void) {
 @property (strong) NSMenuItem *filterItem;
 @property double splOffset;               // dB, applied to the displayed level
 @property (strong) NSMenuItem *offsetItem;
+@property (strong) NSMenuItem *offsetClearItem;
 @property (copy) NSArray<NSString *> *rewInputDevices;
 @property NSInteger apiPort;
 @property BOOL headless;                  // launch REW with -nogui
 @property BOOL noApi;                     // REW is running but its API isn't reachable
 @property (strong) NSTimer *apiWatchTimer;
+@property BOOL startedHeadlessRew;        // we launched a headless REW, so we shut it down on quit
 @property (strong) NSMenuItem *headlessItem;
 @property (strong) NSMenuItem *portItem;
 @end
@@ -122,7 +135,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    NSLog(@"REW SPL menubar app launched");
+    NSLog(@"SPL Bar launched");
     self.statusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:48];
 
@@ -164,10 +177,20 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         if ([kind isEqualToString:@"weighting"]) self.weightingItem = parent; else self.filterItem = parent;
     }
 
-    self.offsetItem = [[NSMenuItem alloc] initWithTitle:@"SPL offset…"
-                                                 action:@selector(editSplOffset:)
-                                          keyEquivalent:@""];
-    self.offsetItem.target = self;
+    NSMenu *offsetMenu = [[NSMenu alloc] init];
+    offsetMenu.autoenablesItems = NO;
+    NSMenuItem *change = [[NSMenuItem alloc] initWithTitle:@"Change offset…"
+                                                    action:@selector(editSplOffset:)
+                                             keyEquivalent:@""];
+    change.target = self;
+    [offsetMenu addItem:change];
+    self.offsetClearItem = [[NSMenuItem alloc] initWithTitle:@"Clear offset"
+                                                      action:@selector(clearSplOffset:)
+                                               keyEquivalent:@""];
+    self.offsetClearItem.target = self;
+    [offsetMenu addItem:self.offsetClearItem];
+    self.offsetItem = [[NSMenuItem alloc] initWithTitle:@"SPL offset" action:nil keyEquivalent:@""];
+    self.offsetItem.submenu = offsetMenu;
     [menu addItem:self.offsetItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
@@ -200,18 +223,26 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *about = [[NSMenuItem alloc]
-        initWithTitle:[NSString stringWithFormat:@"About %@", self.appName]
-               action:@selector(showAbout:)
-        keyEquivalent:@""];
-    about.target = self;
-    [menu addItem:about];
-
-    NSMenuItem *check = [[NSMenuItem alloc] initWithTitle:@"Check for Updates…"
-                                                   action:@selector(checkForUpdates:)
-                                            keyEquivalent:@""];
-    check.target = self;
-    [menu addItem:check];
+    // App submenu: about, updates, and links to the project.
+    NSMenu *appMenu = [[NSMenu alloc] init];
+    NSMenuItem *(^add)(NSString *, SEL) = ^NSMenuItem *(NSString *title, SEL action) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
+        item.target = self;
+        [appMenu addItem:item];
+        return item;
+    };
+    add([NSString stringWithFormat:@"About %@", self.appName], @selector(showAbout:));
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    add(@"Check for Updates Now", @selector(checkForUpdates:));
+    NSMenuItem *startupCheck = add(@"Check for Updates on Startup", @selector(toggleUpdateOnStartup:));
+    startupCheck.state = CheckOnStartup()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    add(@"Help", @selector(openHelp:));
+    add(@"Report an Issue", @selector(openIssues:));
+    NSMenuItem *appParent = [[NSMenuItem alloc] initWithTitle:self.appName action:nil keyEquivalent:@""];
+    appParent.submenu = appMenu;
+    [menu addItem:appParent];
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *quit = [[NSMenuItem alloc]
@@ -245,6 +276,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     });
 
     [self connectToRew];
+    if (CheckOnStartup()) [self checkForUpdatesSilently:YES];
 }
 
 #pragma mark - Input device
@@ -263,7 +295,9 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 - (void)updateMeterOptionMenus {
     self.weightingItem.title = [NSString stringWithFormat:@"Weighting: %@", self.weighting];
     self.filterItem.title = [NSString stringWithFormat:@"Averaging: %@", self.filter];
-    self.offsetItem.title = [NSString stringWithFormat:@"SPL offset: %+g dB", self.splOffset];
+    self.offsetItem.title = [NSString stringWithFormat:self.splOffset == 0 ? @"SPL offset: %g dB" : @"SPL offset: %+g dB",
+                                                       self.splOffset];
+    self.offsetClearItem.hidden = self.splOffset == 0;
 
     for (NSMenuItem *parent in @[self.weightingItem, self.filterItem]) {
         for (NSMenuItem *item in parent.submenu.itemArray) {
@@ -294,7 +328,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     if (!valid) {
         NSAlert *bad = [[NSAlert alloc] init];
         bad.messageText = @"That isn't a valid offset";
-        bad.informativeText = @"Enter a number of dB between -100 and 100.";
+        bad.informativeText = @"Enter a number between -100 and 100.";
         [bad runModal];
         return;
     }
@@ -302,6 +336,12 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     self.splOffset = value;
     if (value == 0) [[NSUserDefaults standardUserDefaults] removeObjectForKey:kOffsetKey];
     else [[NSUserDefaults standardUserDefaults] setDouble:value forKey:kOffsetKey];
+    [self updateMeterOptionMenus];
+}
+
+- (void)clearSplOffset:(id)sender {
+    self.splOffset = 0;
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kOffsetKey];
     [self updateMeterOptionMenus];
 }
 
@@ -444,7 +484,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (NSString *)appName {
-    return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"REW SPL";
+    return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"] ?: @"SPL Bar";
 }
 
 - (NSString *)appVersion {
@@ -469,6 +509,36 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     [NSApp orderFrontStandardAboutPanelWithOptions:@{ NSAboutPanelOptionCredits: credits }];
 }
 
+#pragma mark - Quitting
+
+// A headless REW has no window to close, so if we started one, shut it down on the way out.
+// A REW that was already running (or that we started with its window) is left alone.
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    if (!self.startedHeadlessRew) return NSTerminateNow;
+
+    NSURL *url = [NSURL URLWithString:[[self rewBase] stringByAppendingString:@"/application/command"]];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    request.timeoutInterval = 3;
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{ @"command": @"Shutdown" }
+                                                       options:0 error:nil];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:
+      ^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger status = [(NSHTTPURLResponse *)response statusCode];
+        if (error || status < 200 || status >= 300) {
+            NSString *body = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+            NSLog(@"REW shutdown failed: HTTP %ld %@ %@", (long)status, error, body);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSApp replyToApplicationShouldTerminate:YES];
+        });
+    }] resume];
+
+    return NSTerminateLater;   // wait for REW to acknowledge (or time out) before exiting
+}
+
 #pragma mark - Updates
 
 - (void)alert:(NSString *)message info:(NSString *)info downloadURL:(NSString *)url {
@@ -486,12 +556,33 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
 }
 
 - (void)checkForUpdates:(id)sender {
+    [self checkForUpdatesSilently:NO];
+}
+
+- (void)toggleUpdateOnStartup:(NSMenuItem *)sender {
+    BOOL on = sender.state != NSControlStateValueOn;
+    sender.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kCheckOnStartupKey];
+}
+
+- (void)openHelp:(id)sender {
+    [[NSWorkspace sharedWorkspace] openURL:
+        [NSURL URLWithString:kHelpURL]];
+}
+
+- (void)openIssues:(id)sender {
+    [[NSWorkspace sharedWorkspace] openURL:
+        [NSURL URLWithString:kIssuesURL]];
+}
+
+// With silent=YES (the startup check) it says nothing unless a newer version exists.
+- (void)checkForUpdatesSilently:(BOOL)silent {
     NSURL *url = [NSURL URLWithString:
         [NSString stringWithFormat:@"https://api.github.com/repos/%@/releases/latest", kRepo]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.timeoutInterval = 15;
     [req setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"dialup-audio-rew-spl-meter" forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"dialup-audio-spl-bar" forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -499,11 +590,11 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
         id json = (!error && data && status == 200)
             ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
         NSString *tag = [json isKindOfClass:[NSDictionary class]] ? json[@"tag_name"] : nil;
-        NSString *page = [json isKindOfClass:[NSDictionary class]] ? json[@"html_url"] : nil;
-
+        
         dispatch_async(dispatch_get_main_queue(), ^{
             if (![tag isKindOfClass:[NSString class]]) {
                 NSLog(@"update check failed (status %ld): %@", (long)status, error);
+                if (silent) return;
                 [self alert:@"Couldn't check for updates"
                        info:@"Check your internet connection and try again."
                 downloadURL:nil];
@@ -515,6 +606,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
                          == NSOrderedDescending;
 
             if (!newer) {
+                if (silent) return;
                 [self alert:@"You're up to date"
                        info:[NSString stringWithFormat:@"%@ %@ is the latest version.",
                              [self appName], [self appVersion]]
@@ -522,14 +614,9 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
                 return;
             }
 
-            // Only ever open a page on this project's own GitHub repo.
-            NSString *repoPrefix = [NSString stringWithFormat:@"https://github.com/%@/", kRepo];
-            NSString *target = ([page isKindOfClass:[NSString class]] && [page hasPrefix:repoPrefix])
-                ? page : [repoPrefix stringByAppendingString:@"releases/latest"];
-
             [self alert:[NSString stringWithFormat:@"Version %@ is available", latest]
                    info:[NSString stringWithFormat:@"You have version %@.", [self appVersion]]
-            downloadURL:target];
+            downloadURL:kHelpURL];
         });
     }];
     [task resume];
@@ -621,6 +708,7 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     NSMutableArray<NSString *> *args = [@[@"-na", @"REW.app", @"--args", @"-api"] mutableCopy];
     if (self.headless) [args addObject:@"-nogui"];
     NSLog(@"launching REW: open %@", [args componentsJoinedByString:@" "]);
+    self.startedHeadlessRew = self.headless;
 
     NSError *error = nil;
     NSTask *task = [[NSTask alloc] init];
