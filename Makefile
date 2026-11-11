@@ -1,3 +1,4 @@
+.PHONY: build run clean
 .DEFAULT_GOAL := build
 BUILD_DIR := build
 
@@ -6,7 +7,7 @@ build:
 	cmake --build $(BUILD_DIR) -j
 
 run: build
-	open ./$(BUILD_DIR)/rew-dock-spl-meter.app
+	open ./$(BUILD_DIR)/rew-spl-meter.app
 
 clean:
 	rm -rf $(BUILD_DIR)
