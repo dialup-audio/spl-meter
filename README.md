@@ -80,3 +80,9 @@ Ideas and requests are welcome through **Report an Issue (web)** in the app's me
 ## Updates
 
 On first launch the app asks whether it may check for updates on startup, and makes no network request until you say yes. If you do, it asks GitHub once per launch whether a newer release exists and only speaks up if there is one. You can change your answer any time with **Check for Updates on Startup** in the app's menu; with it off, the app makes no network requests at all. **Check for Updates Now** does the same on demand and always tells you the result. Nothing is downloaded or installed automatically: the Download button opens the product page on dialup.audio. REW is talked to over localhost, so these checks are the only requests the app makes outside your machine. The same menu has **Help (web)** and **Report an Issue (web)**, which open the project pages on dialup.audio.
+
+## License
+
+Copyright (c) 2026 dialup.audio, Chason Deshotel.
+
+Released under the [GNU General Public License v3.0](LICENSE). You're free to use, study, modify and share it. If you distribute a modified version, it has to be released under the same license with its source. The name and branding (including "Dial-Up" and dialup.audio) aren't covered by the license, so please don't use them for a fork.
