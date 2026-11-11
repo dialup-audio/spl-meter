@@ -9,10 +9,12 @@ static NSString * const kHelpURL     = @"https://dialup.audio/spl-bar";
 static NSString * const kIssuesURL   = @"https://dialup.audio/spl-bar/issues";
 static NSString * const kCheckOnStartupKey = @"checkUpdatesOnStartup";
 
-// On unless the user has turned it off.
+// Unset until the user answers the first-launch question.
+static BOOL CheckOnStartupAnswered() {
+    return [[NSUserDefaults standardUserDefaults] objectForKey:kCheckOnStartupKey] != nil;
+}
 static BOOL CheckOnStartup() {
-    id value = [[NSUserDefaults standardUserDefaults] objectForKey:kCheckOnStartupKey];
-    return value ? [value boolValue] : YES;
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kCheckOnStartupKey];
 }
 
 
@@ -118,6 +120,7 @@ static NSArray<NSString *> *CoreAudioInputDeviceNames(void) {
 @property (strong) NSMenuItem *filterItem;
 @property double splOffset;               // dB, applied to the displayed level
 @property (strong) NSMenuItem *offsetItem;
+@property (strong) NSMenuItem *startupCheckItem;
 @property (strong) NSMenuItem *offsetClearItem;
 @property (copy) NSArray<NSString *> *rewInputDevices;
 @property NSInteger apiPort;
@@ -234,12 +237,12 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     add([NSString stringWithFormat:@"About %@", self.appName], @selector(showAbout:));
     [appMenu addItem:[NSMenuItem separatorItem]];
     add(@"Check for Updates Now", @selector(checkForUpdates:));
-    NSMenuItem *startupCheck = add(@"Check for Updates on Startup", @selector(toggleUpdateOnStartup:));
-    startupCheck.state = CheckOnStartup()
+    self.startupCheckItem = add(@"Check for Updates on Startup", @selector(toggleUpdateOnStartup:));
+    self.startupCheckItem.state = CheckOnStartup()
         ? NSControlStateValueOn : NSControlStateValueOff;
     [appMenu addItem:[NSMenuItem separatorItem]];
-    add(@"Help", @selector(openHelp:));
-    add(@"Report an Issue", @selector(openIssues:));
+    add(@"Help (web)", @selector(openHelp:));
+    add(@"Report an Issue (web)", @selector(openIssues:));
     NSMenuItem *appParent = [[NSMenuItem alloc] initWithTitle:self.appName action:nil keyEquivalent:@""];
     appParent.submenu = appMenu;
     [menu addItem:appParent];
@@ -276,7 +279,12 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     });
 
     [self connectToRew];
-    if (CheckOnStartup()) [self checkForUpdatesSilently:YES];
+    if (!CheckOnStartupAnswered()) {
+        // First launch: ask before touching the network. Deferred so the menubar item is up first.
+        dispatch_async(dispatch_get_main_queue(), ^{ [self askAboutStartupUpdateCheck]; });
+    } else if (CheckOnStartup()) {
+        [self checkForUpdatesSilently:YES];
+    }
 }
 
 #pragma mark - Input device
@@ -559,10 +567,26 @@ static const NSTimeInterval kMeterStartRetryDelay = 2.0;
     [self checkForUpdatesSilently:NO];
 }
 
-- (void)toggleUpdateOnStartup:(NSMenuItem *)sender {
-    BOOL on = sender.state != NSControlStateValueOn;
-    sender.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+- (void)setCheckOnStartup:(BOOL)on {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kCheckOnStartupKey];
+    self.startupCheckItem.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)toggleUpdateOnStartup:(NSMenuItem *)sender {
+    [self setCheckOnStartup:sender.state != NSControlStateValueOn];
+}
+
+// Shown once, on first launch. The app makes no network request until the user says yes.
+- (void)askAboutStartupUpdateCheck {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Check for updates on startup?";
+    alert.informativeText = @"Nothing is downloaded or installed automatically. If an update is available, you'll be prompted with a link to the latest release, where you can review the changes before downloading and installing.\n\nYou can change this any time from the app's menu.";
+    [alert addButtonWithTitle:@"Yes"];
+    [alert addButtonWithTitle:@"No"];
+    [NSApp activateIgnoringOtherApps:YES];
+    BOOL yes = [alert runModal] == NSAlertFirstButtonReturn;
+    [self setCheckOnStartup:yes];
+    if (yes) [self checkForUpdatesSilently:YES];   // we're still technically starting up
 }
 
 - (void)openHelp:(id)sender {
